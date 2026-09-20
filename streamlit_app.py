@@ -356,7 +356,25 @@ with st.sidebar:
             file_name="forkcast-log.json",
             mime="application/json",
         )
-        st.caption("Storage here resets when the app restarts — export to keep a permanent copy.")
+
+    restore_file = st.file_uploader("Restore a log export", type="json", label_visibility="visible")
+    if restore_file is not None:
+        try:
+            restored = json.load(restore_file)
+            if isinstance(restored, list):
+                st.session_state.log = restored
+                save_log(st.session_state.log)
+                st.success(f"Restored {len(restored)} entries.")
+            else:
+                st.error("That file doesn't look like a Forkcast log export.")
+        except Exception:
+            st.error("Couldn't read that file as JSON.")
+
+    st.caption(
+        "This app's storage resets on redeploy — export before you push changes, restore after. "
+        "A real fix (survives redeploys automatically) needs an external database; ask me to wire one up "
+        "when you're ready, it's a bigger step than this stopgap."
+    )
 
 # ----------------------------------- main ----------------------------------
 
@@ -365,6 +383,17 @@ st.caption(
     "Feed it a real decision or an open question. It researches live data, debates it internally "
     "across several angles, then maps out scenarios or breaks the answer down across every field that applies."
 )
+
+with st.expander("Why not just ask ChatGPT or Claude?"):
+    st.write(
+        "Honestly, for any single question, a good enough prompt gets you most of the way there — the "
+        "underlying model isn't exclusive to this app. What Forkcast actually does differently: it forces "
+        "the same rigor every time — live research, three specialists arguing their own angle, a devil's "
+        "advocate challenge — whether or not you remembered to ask for all of that today. And it "
+        "remembers. Every decision below gets logged; once you've logged a few real outcomes, the sidebar "
+        "shows how often the top pick was actually right. A stateless chat has no track record to check "
+        "against. This one does, and it grows every time you use it."
+    )
 
 mode = st.radio("Mode", ["Decision", "Explore a question"], horizontal=True, label_visibility="collapsed")
 is_decision = mode == "Decision"
@@ -383,24 +412,29 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
         st.warning("Type something in first.")
     else:
         try:
-            with st.status("Researching…", expanded=False) as status:
+            with st.status("Researching…", expanded=True) as status:
                 if is_decision:
                     rprompt = (
                         f'Research current, real information relevant to evaluating this technical decision: '
                         f'"{user_input}". Prioritize authoritative sources appropriate to the subject — official '
                         f'docs, benchmarks, and pricing pages for technical questions, recent industry reporting '
-                        f'for market questions. Look for concrete benchmarks, pricing, timelines, precedents, '
-                        f'recent incidents, or competing approaches — numbers over generalities where you can '
-                        f'find them. Summarize the specific facts and data points you find, with sources.'
+                        f'for market questions. When a search result looks especially relevant, visit the actual '
+                        f'page rather than relying on the snippet alone. Look for concrete benchmarks, pricing, '
+                        f'timelines, precedents, recent incidents, or competing approaches — numbers over '
+                        f'generalities where you can find them. Summarize the specific facts and data points you '
+                        f'find, with sources.'
                     )
                 else:
                     rprompt = (
                         f'Research current, accurate background information relevant to this question, across '
                         f'whichever fields genuinely apply: "{user_input}". Prioritize authoritative sources '
-                        f'appropriate to each field. Summarize the key facts and mechanisms each relevant field '
-                        f'would point to, with sources.'
+                        f'appropriate to each field. When a search result looks especially relevant, visit the '
+                        f'actual page rather than relying on the snippet alone. Summarize the key facts and '
+                        f'mechanisms each relevant field would point to, with sources.'
                     )
                 notes, _tools = research(rprompt)
+                preview = (notes[:240] + "…") if len(notes) > 240 else notes
+                st.write(preview if preview else "No additional research surfaced beyond what's already known.")
 
                 status.update(label="Specialists debating, critiquing, revising…")
                 if is_decision:
@@ -418,6 +452,13 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
                     DECISION_SCHEMA if is_decision else EXPLORE_SCHEMA,
                     5000 if is_decision else 3500,
                     "high" if is_decision else "medium",
+                )
+                st.write(
+                    "Weighed cost, risk, and feasibility angles, ran a devil's-advocate challenge against the "
+                    "strongest path, then synthesized a final recommendation."
+                    if is_decision else
+                    "Identified the disciplines that genuinely apply and drafted, then double-checked, an "
+                    "explanation through each."
                 )
                 status.update(label="Done", state="complete")
 
@@ -516,7 +557,7 @@ if result:
     if result["_mode"] == "decision":
         if st.button("⤵ Dig deeper (one more targeted research pass)"):
             try:
-                with st.status("Finding the weak points…", expanded=False) as status:
+                with st.status("Finding the weak points…", expanded=True) as status:
                     draft = json.dumps({
                         "recommendation": result["recommendation"],
                         "scenarios": result["scenarios"],
@@ -525,8 +566,11 @@ if result:
                         f'Here is a draft decision analysis for: "{st.session_state.last_input}". '
                         f"Draft so far: {draft}. Identify what's still uncertain, thinly supported, or missing "
                         f"from this draft, then research specifically to address those weak points with concrete, "
-                        f"current data. Summarize what you find, with sources."
+                        f"current data. Visit full pages where a snippet isn't enough. Summarize what you find, "
+                        f"with sources."
                     )
+                    gap_preview = (gap_notes[:240] + "…") if len(gap_notes) > 240 else gap_notes
+                    st.write(gap_preview if gap_preview else "No further gaps surfaced new data.")
                     status.update(label="Revising the analysis…")
                     revised, trace = reason(
                         "You are the same decision-simulation analyst revising your prior analysis now that more "
@@ -538,6 +582,7 @@ if result:
                         f"New targeted research:\n{gap_notes}\n\nProduce the revised, final analysis now.",
                         DECISION_SCHEMA, 5000, "high",
                     )
+                    st.write("Re-weighed the analysis against the new evidence and revised where it held or broke.")
                     status.update(label="Done", state="complete")
                 revised["_mode"] = "decision"
                 revised["sources"] = list(dict.fromkeys(result.get("sources", []) + revised.get("sources", [])))
