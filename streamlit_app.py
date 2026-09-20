@@ -14,6 +14,7 @@ import requests
 import streamlit as st
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
 MODEL_RESEARCH = "groq/compound"
 MODEL_REASONING = "openai/gpt-oss-120b"
 LOG_PATH = "forkcast_log.json"
@@ -229,12 +230,118 @@ def reason(system: str, user: str, schema: dict, max_tokens: int, effort: str) -
         raise RuntimeError("Couldn't parse the model's output as JSON. Try running it again.")
 
 
+def get_gemini_key() -> str:
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        return ""
+
+
+def dual_model_available() -> bool:
+    return bool(get_gemini_key())
+
+
+def call_gemini(system: str, user: str, max_tokens: int = 1400) -> str:
+    key = get_gemini_key()
+    if not key:
+        raise RuntimeError("No Gemini API key found.")
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.5},
+    }
+    resp = requests.post(
+        GEMINI_URL,
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    if not resp.ok:
+        detail = resp.text
+        try:
+            detail = resp.json().get("error", {}).get("message", resp.text)
+        except Exception:
+            pass
+        raise RuntimeError(f"Gemini API error ({resp.status_code}): {detail}")
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError("Gemini returned a response with no readable text — the prompt may have been blocked.")
+
+
+def independent_draft_prompt(is_decision: bool, subject: str, notes: str) -> str:
+    if is_decision:
+        return (
+            f'Decision: "{subject}"\n\nResearch notes:\n{notes or "(none found)"}\n\n'
+            f"Give your own independent read: a recommended path, 2-3 possible scenarios for how this "
+            f"plays out with rough likelihoods, and the key risks. Be concise but substantive — another "
+            f"analyst is independently doing the same and the two views will be reconciled afterward, so "
+            f"give your genuine, undiluted assessment rather than hedging toward a safe middle."
+        )
+    return (
+        f'Question: "{subject}"\n\nResearch notes:\n{notes or "(none found)"}\n\n'
+        f"Give your own independent breakdown of this question across whichever disciplines genuinely "
+        f"apply. Be concise but substantive — another analyst is independently doing the same and the "
+        f"two views will be reconciled afterward."
+    )
+
+
 # --------------------------------------------------------------------------
-# Decision log — session state is the source of truth; the file is a bonus
+# Decision log — Supabase when configured (survives redeploys), local JSON file
+# as a fallback that always works but resets when Community Cloud restarts the app.
 # --------------------------------------------------------------------------
+
+
+def get_supabase_config() -> tuple:
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
+    except Exception:
+        url, key = "", ""
+    return url.rstrip("/"), key
+
+
+def supabase_headers(key: str) -> dict:
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
 
 
 def load_log() -> list:
+    url, key = get_supabase_config()
+    if url and key:
+        try:
+            resp = requests.get(
+                f"{url}/rest/v1/forkcast_log?select=*&order=date.desc",
+                headers=supabase_headers(key),
+                timeout=15,
+            )
+            if resp.ok:
+                st.session_state["_supabase_status"] = "connected"
+                return [
+                    {
+                        "id": r.get("id"),
+                        "decision": r.get("decision", ""),
+                        "date": r.get("date", ""),
+                        "summary": r.get("summary", ""),
+                        "confidence": r.get("confidence", ""),
+                        "scenarios": r.get("scenarios") or [],
+                        "outcome": r.get("outcome") or "",
+                        "matched": r.get("matched") or "",
+                    }
+                    for r in resp.json()
+                ]
+            st.session_state["_supabase_status"] = (
+                f"configured but got HTTP {resp.status_code} — check the table exists and the key is correct"
+            )
+        except Exception as exc:
+            st.session_state["_supabase_status"] = f"configured but unreachable ({exc})"
+    else:
+        st.session_state["_supabase_status"] = None
     try:
         with open(LOG_PATH, "r", encoding="utf-8") as fh:
             return json.load(fh)
@@ -248,6 +355,41 @@ def save_log(log: list) -> None:
             json.dump(log, fh, indent=2)
     except Exception:
         pass  # ephemeral disk on Community Cloud; session state still holds it
+
+
+def insert_log_entry(entry: dict) -> None:
+    url, key = get_supabase_config()
+    if not (url and key):
+        return
+    try:
+        requests.post(f"{url}/rest/v1/forkcast_log", headers=supabase_headers(key), json=entry, timeout=15)
+    except Exception:
+        pass  # local file (already saved by the caller) still has it for this session
+
+
+def update_log_entry(entry_id, patch: dict) -> None:
+    url, key = get_supabase_config()
+    if not (url and key):
+        return
+    try:
+        requests.patch(
+            f"{url}/rest/v1/forkcast_log?id=eq.{entry_id}",
+            headers=supabase_headers(key),
+            json=patch,
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+
+def delete_log_entry(entry_id) -> None:
+    url, key = get_supabase_config()
+    if not (url and key):
+        return
+    try:
+        requests.delete(f"{url}/rest/v1/forkcast_log?id=eq.{entry_id}", headers=supabase_headers(key), timeout=15)
+    except Exception:
+        pass
 
 
 def calibration(log: list):
@@ -315,6 +457,19 @@ with st.sidebar:
     risk = st.radio("Risk tolerance", ["conservative", "balanced", "aggressive"], index=1)
 
     st.divider()
+    if dual_model_available():
+        st.caption("🔀 Dual-model mode: Gemini 3 Flash + GPT-OSS-120B independently draft, then reconcile.")
+    else:
+        st.caption("Single-model mode. Add GEMINI_API_KEY in secrets to have Gemini and GPT-OSS draft independently and reconcile.")
+
+    supa_status = st.session_state.get("_supabase_status")
+    if supa_status == "connected":
+        st.caption("💾 Decision log: saved to Supabase — survives redeploys.")
+    elif supa_status:
+        st.caption(f"⚠️ Supabase {supa_status}. Using local storage for now (resets on redeploy).")
+    else:
+        st.caption("💾 Decision log: local only — resets on redeploy. Add SUPABASE_URL/SUPABASE_KEY in secrets for real persistence.")
+
     st.subheader("Decision log")
     cal = calibration(st.session_state.log)
     if cal:
@@ -339,14 +494,17 @@ with st.sidebar:
                 if resolved != entry.get("matched", ""):
                     entry["matched"] = resolved
                     save_log(st.session_state.log)
+                    update_log_entry(entry["id"], {"matched": resolved})
                     st.rerun()
             note = st.text_input("What actually happened?", value=entry.get("outcome", ""), key=f"out_{entry['id']}")
             if note != entry.get("outcome", ""):
                 entry["outcome"] = note
                 save_log(st.session_state.log)
+                update_log_entry(entry["id"], {"outcome": note})
             if st.button("Delete", key=f"del_{entry['id']}"):
                 st.session_state.log = [e for e in st.session_state.log if e["id"] != entry["id"]]
                 save_log(st.session_state.log)
+                delete_log_entry(entry["id"])
                 st.rerun()
 
     if st.session_state.log:
@@ -436,6 +594,35 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
                 preview = (notes[:240] + "…") if len(notes) > 240 else notes
                 st.write(preview if preview else "No additional research surfaced beyond what's already known.")
 
+                draft_gemini, draft_groq = "", ""
+                if dual_model_available():
+                    status.update(label="Gemini and GPT-OSS forming independent views…")
+                    dprompt = independent_draft_prompt(is_decision, user_input, notes)
+                    try:
+                        draft_gemini = call_gemini(
+                            "You are a sharp, independent analyst. Give a direct, opinionated first take — "
+                            "no hedging, no disclaimers.",
+                            dprompt,
+                        )
+                    except Exception as exc:
+                        draft_gemini = ""
+                        st.write(f"(Gemini's independent draft failed, continuing without it: {exc})")
+                    try:
+                        draft_data = call_groq(
+                            MODEL_REASONING,
+                            [
+                                {"role": "system", "content": "You are a sharp, independent analyst. Give a direct, opinionated first take — no hedging, no disclaimers."},
+                                {"role": "user", "content": dprompt},
+                            ],
+                            max_tokens=900,
+                            reasoning_format="hidden",
+                        )
+                        draft_groq = draft_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    except Exception as exc:
+                        draft_groq = ""
+                        st.write(f"(GPT-OSS's independent draft failed, continuing without it: {exc})")
+                    st.write("Both independent drafts are in — reconciling them into one answer now.")
+
                 status.update(label="Specialists debating, critiquing, revising…")
                 if is_decision:
                     system = DECISION_SYSTEM + (
@@ -445,10 +632,25 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
                     )
                 else:
                     system = EXPLORE_SYSTEM
+                user_msg = (
+                    f"{'Decision' if is_decision else 'Question'}: {user_input}\n\n"
+                    f"Research notes:\n{notes or '(no additional research found)'}\n\nProduce the analysis now."
+                )
+                if draft_gemini or draft_groq:
+                    system += (
+                        " Two other analysts have already given independent first drafts, included below. "
+                        "Weigh both seriously as part of your specialist reasoning. Where they agree, treat that "
+                        "as a stronger signal and reflect it in your confidence. Where they genuinely disagree, "
+                        "that disagreement is itself useful information — factor it into your counter_argument "
+                        "and don't paper over it."
+                    )
+                    user_msg += (
+                        f"\n\nIndependent draft from Gemini:\n{draft_gemini or '(unavailable)'}"
+                        f"\n\nIndependent draft from GPT-OSS:\n{draft_groq or '(unavailable)'}"
+                    )
                 parsed, trace = reason(
                     system,
-                    f"{'Decision' if is_decision else 'Question'}: {user_input}\n\n"
-                    f"Research notes:\n{notes or '(no additional research found)'}\n\nProduce the analysis now.",
+                    user_msg,
                     DECISION_SCHEMA if is_decision else EXPLORE_SCHEMA,
                     5000 if is_decision else 3500,
                     "high" if is_decision else "medium",
@@ -463,13 +665,15 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
                 status.update(label="Done", state="complete")
 
             parsed["_mode"] = "decision" if is_decision else "explore"
+            parsed["_draft_gemini"] = draft_gemini
+            parsed["_draft_groq"] = draft_groq
             st.session_state.result = parsed
             st.session_state.trace = trace
             st.session_state.last_input = user_input
             st.session_state.followups = []
 
             if is_decision:
-                st.session_state.log.insert(0, {
+                new_entry = {
                     "id": str(datetime.now().timestamp()),
                     "decision": user_input,
                     "date": datetime.now().strftime("%d %b %Y"),
@@ -480,9 +684,11 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
                     ],
                     "outcome": "",
                     "matched": "",
-                })
+                }
+                st.session_state.log.insert(0, new_entry)
                 st.session_state.log = st.session_state.log[:MAX_LOG_ENTRIES]
                 save_log(st.session_state.log)
+                insert_log_entry(new_entry)
         except Exception as exc:
             st.error(str(exc))
 
@@ -544,6 +750,16 @@ if result:
                 st.markdown(f"**What would change this:** {sc['pivot_condition']}")
                 st.markdown(f"**Estimate based on:** {sc['estimate_basis']}")
             st.write("")
+
+    if result.get("_draft_gemini") or result.get("_draft_groq"):
+        with st.expander("See the independent drafts, before reconciliation (Gemini vs. GPT-OSS)"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Gemini's independent take**")
+                st.write(result.get("_draft_gemini") or "_unavailable this run_")
+            with col2:
+                st.markdown("**GPT-OSS's independent take**")
+                st.write(result.get("_draft_groq") or "_unavailable this run_")
 
     if st.session_state.trace:
         with st.expander("Analysis notes (specialists → challenge → synthesis)"):
