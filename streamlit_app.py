@@ -7,6 +7,7 @@ key never reaches the browser and there is no CORS to fight.
 
 import json
 import os
+import re
 from datetime import datetime
 
 import requests
@@ -150,17 +151,38 @@ def call_groq(model: str, messages: list, **options) -> dict:
     key = get_api_key()
     if not key:
         raise RuntimeError("No Groq API key found. Add one in the sidebar, or set GROQ_API_KEY in your app secrets.")
-    payload = {"model": model, "messages": messages, "temperature": 0.4, **options}
-    resp = requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=180,
-    )
+
+    def do_request(opts):
+        payload = {"model": model, "messages": messages, "temperature": 0.4, **opts}
+        return requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=180,
+        )
+
+    resp = do_request(options)
+
+    # Groq returns 413 when the *requested max_tokens ceiling* — not the actual
+    # prompt — exceeds what a single request is allowed to ask for on this
+    # account. A two-word prompt fails just as fast as a long one if max_tokens
+    # is set above that ceiling. Rather than guess the right number, read the
+    # real limit out of Groq's own error message and retry once at a safe size.
+    if resp.status_code == 413 and "max_tokens" in options:
+        try:
+            err_text = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            err_text = resp.text
+        match = re.search(r"[Ll]imit[:\s]+(\d+)", err_text)
+        if match:
+            safe_tokens = max(256, int(match.group(1)) - 400)  # headroom for input tokens
+            if safe_tokens < options["max_tokens"]:
+                resp = do_request({**options, "max_tokens": safe_tokens})
+
     if resp.status_code == 429:
         raise RuntimeError(
-            "Groq rate limit hit. The free tier caps tokens per minute and a full run is token-heavy — "
-            "wait a moment and retry, or raise the limit by adding a card at console.groq.com."
+            "Groq rate limit hit — too many requests or tokens used this minute. Wait a moment and retry, "
+            "or raise the limit by adding a card at console.groq.com (free, no minimum spend)."
         )
     if not resp.ok:
         detail = resp.text
@@ -184,7 +206,7 @@ def strip_fences(raw: str) -> str:
 
 
 def research(prompt: str) -> tuple:
-    data = call_groq(MODEL_RESEARCH, [{"role": "user", "content": prompt}], max_tokens=1300)
+    data = call_groq(MODEL_RESEARCH, [{"role": "user", "content": prompt}], max_tokens=800)
     msg = data.get("choices", [{}])[0].get("message", {})
     return msg.get("content", ""), msg.get("executed_tools")
 
@@ -394,7 +416,7 @@ if st.button("Run simulation" if is_decision else "Explore this", type="primary"
                     f"{'Decision' if is_decision else 'Question'}: {user_input}\n\n"
                     f"Research notes:\n{notes or '(no additional research found)'}\n\nProduce the analysis now.",
                     DECISION_SCHEMA if is_decision else EXPLORE_SCHEMA,
-                    6500 if is_decision else 4200,
+                    5000 if is_decision else 3500,
                     "high" if is_decision else "medium",
                 )
                 status.update(label="Done", state="complete")
@@ -514,7 +536,7 @@ if result:
                         f"shape. The user's stated risk tolerance is {risk}.",
                         f"Decision: {st.session_state.last_input}\n\nPrior draft:\n{draft}\n\n"
                         f"New targeted research:\n{gap_notes}\n\nProduce the revised, final analysis now.",
-                        DECISION_SCHEMA, 6500, "high",
+                        DECISION_SCHEMA, 5000, "high",
                     )
                     status.update(label="Done", state="complete")
                 revised["_mode"] = "decision"
